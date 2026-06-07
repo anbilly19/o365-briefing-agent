@@ -1,0 +1,47 @@
+[
+  {
+    "id": "msg_001",
+    "subject": "Can you review the API spec before Friday?",
+    "sender": "alice@example.com",
+    "received_at": "2026-06-07T08:15:00+00:00",
+    "body_preview": "Hi, I've updated the API spec doc. Could you take a look and give feedback before our Friday standup? Especially the auth section.",
+    "thread_id": "thread_001",
+    "is_reply": false
+  },
+  {
+    "id": "msg_002",
+    "subject": "Waiting for your approval on the budget proposal",
+    "sender": "bob@example.com",
+    "received_at": "2026-06-07T09:00:00+00:00",
+    "body_preview": "Just a reminder that the Q3 budget proposal is sitting in your inbox. Once you approve, I can send it to finance. No rush but ideally by end of week.",
+    "thread_id": "thread_002",
+    "is_reply": false
+  },
+  {
+    "id": "msg_003",
+    "subject": "Re: Deployment on Tuesday",
+    "sender": "ops@example.com",
+    "received_at": "2026-06-07T09:30:00+00:00",
+    "body_preview": "We've completed the deployment. All services are green. Monitoring for the next 24h. No action needed from your side.",
+    "thread_id": "thread_003",
+    "is_reply": true
+  },
+  {
+    "id": "msg_004",
+    "subject": "Weekly SaaS Newsletter — Top AI Tools",
+    "sender": "noreply@saas-weekly.com",
+    "received_at": "2026-06-07T07:00:00+00:00",
+    "body_preview": "This week in AI: 10 tools you need to know. Sponsored by CloudCo. Unsubscribe here.",
+    "thread_id": null,
+    "is_reply": false
+  },
+  {
+    "id": "msg_005",
+    "subject": "Invoice #4421 generated",
+    "sender": "billing@provider.com",
+    "received_at": "2026-06-07T06:00:00+00:00",
+    "body_preview": "Your invoice for June has been generated. Amount: €120. Due date: June 30.",
+    "thread_id": null,
+    "is_reply": false
+  }
+]
