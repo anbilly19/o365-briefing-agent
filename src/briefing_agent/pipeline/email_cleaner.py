@@ -1,84 +1,109 @@
-"""Email cleaner and pre-LLM filter.
+"""Email body cleaning pipeline.
 
-Cleans raw messages and filters out low-value content
-(newsletters, promotions, automated notifications) BEFORE
-sending anything to the local model.
+Steps:
+  1. Detect HTML vs plain text.
+  2. Strip HTML using html2text (primary) or BeautifulSoup (fallback).
+  3. Collapse whitespace / quoted reply chains.
+  4. Append attachment filenames as a metadata note.
+  5. Normalise to plain UTF-8.
 
-Lesson from the video: one newsletter with tracking links +
-image labels + legal footers can be thousands of characters.
-Cleaning and filtering before the LLM call makes a big
-difference in runtime and output quality.
+No content is downloaded — attachments are represented only as their
+filenames, sourced from Graph API metadata.
 """
 
 from __future__ import annotations
 
 import re
-from briefing_agent.models import MessageEnvelope
 
-# Sender/subject patterns that are almost never worth LLM time
-LOW_VALUE_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"no.?reply", re.I),
-    re.compile(r"noreply", re.I),
-    re.compile(r"newsletter", re.I),
-    re.compile(r"unsubscribe", re.I),
-    re.compile(r"notification@", re.I),
-    re.compile(r"alerts?@", re.I),
-    re.compile(r"donotreply", re.I),
-    re.compile(r"mailer.daemon", re.I),
-    re.compile(r"automated", re.I),
-    re.compile(r"invoice.generated", re.I),
-    re.compile(r"github\.com/notifications", re.I),
-]
+try:
+    import html2text as _html2text
+    _H2T_AVAILABLE = True
+except ImportError:
+    _H2T_AVAILABLE = False
 
-SUBJECT_LOW_VALUE: list[re.Pattern[str]] = [
-    re.compile(r"\[github\]", re.I),
-    re.compile(r"build (passed|failed|succeeded)", re.I),
-    re.compile(r"your (weekly|monthly|daily) digest", re.I),
-    re.compile(r"^fyi:", re.I),
-]
-
-MAX_BODY_CHARS = 800  # truncation limit before sending to LLM
+try:
+    from bs4 import BeautifulSoup
+    _BS4_AVAILABLE = True
+except ImportError:
+    _BS4_AVAILABLE = False
 
 
-class EmailCleaner:
-    def clean_and_filter(
-        self, messages: list[MessageEnvelope]
-    ) -> tuple[list[MessageEnvelope], list[MessageEnvelope]]:
-        """Return (kept, skipped) after cleaning and filtering."""
-        kept: list[MessageEnvelope] = []
-        skipped: list[MessageEnvelope] = []
+_QUOTED_REPLY_RE = re.compile(
+    r"(-{3,}\s*(Original Message|On .+ wrote).*)",
+    re.IGNORECASE | re.DOTALL,
+)
+_WHITESPACE_RE = re.compile(r"\n{3,}")
 
-        for msg in messages:
-            if self._is_low_value(msg):
-                skipped.append(msg)
-            else:
-                kept.append(self._clean(msg))
 
-        return kept, skipped
+def _strip_html_h2t(html: str) -> str:
+    h = _html2text.HTML2Text()
+    h.ignore_links = True
+    h.ignore_images = True
+    h.ignore_emphasis = False
+    h.body_width = 0  # don't wrap
+    return h.handle(html)
 
-    @staticmethod
-    def _is_low_value(msg: MessageEnvelope) -> bool:
-        text = f"{msg.sender} {msg.subject}"
-        if any(p.search(text) for p in LOW_VALUE_PATTERNS):
-            return True
-        if any(p.search(msg.subject) for p in SUBJECT_LOW_VALUE):
-            return True
-        return False
 
-    @staticmethod
-    def _clean(msg: MessageEnvelope) -> MessageEnvelope:
-        """Strip noise from body_preview and truncate."""
-        body = msg.body_preview
+def _strip_html_bs4(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    return soup.get_text(separator=" ", strip=True)
 
-        # Remove URLs
-        body = re.sub(r"https?://\S+", "", body)
-        # Remove email-style footers
-        body = re.sub(
-            r"(unsubscribe|view in browser|legal footer|privacy policy)[\s\S]*", "", body, flags=re.I
-        )
-        # Collapse whitespace
-        body = re.sub(r"\s{3,}", "  ", body).strip()
-        # Truncate
-        body = body[:MAX_BODY_CHARS]
 
-        return msg.model_copy(update={"body_preview": body})
+def _strip_html_naive(html: str) -> str:
+    """Last-resort: regex tag stripping with no dependencies."""
+    text = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"&[a-z]+;", " ", text)
+
+
+def strip_html(html: str) -> str:
+    """Strip HTML to plain text, trying html2text → BS4 → regex fallback."""
+    if _H2T_AVAILABLE:
+        return _strip_html_h2t(html)
+    if _BS4_AVAILABLE:
+        return _strip_html_bs4(html)
+    return _strip_html_naive(html)
+
+
+def is_html(text: str) -> bool:
+    """Heuristic: does this look like HTML?"""
+    stripped = text.lstrip()[:200].lower()
+    return stripped.startswith("<html") or "<body" in stripped or "<div" in stripped
+
+
+def clean_body(
+    raw_body: str,
+    attachments: list[str] | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """Clean an email body and append attachment metadata.
+
+    Args:
+        raw_body:    The raw body string (HTML or plain text).
+        attachments: List of attachment filenames from Graph API metadata.
+        max_chars:   If given, truncate the cleaned body to this many chars.
+
+    Returns:
+        A clean UTF-8 plain-text string suitable for LLM input.
+    """
+    text = raw_body
+
+    # 1. Strip HTML if needed
+    if is_html(text):
+        text = strip_html(text)
+
+    # 2. Remove quoted reply chains (keep only the latest message)
+    text = _QUOTED_REPLY_RE.sub("", text)
+
+    # 3. Collapse excessive blank lines
+    text = _WHITESPACE_RE.sub("\n\n", text).strip()
+
+    # 4. Truncate if a budget cap is given
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars]
+
+    # 5. Append attachment note at the end (after truncation, always included)
+    if attachments:
+        note = "[Attachments: " + ", ".join(attachments) + "]"
+        text = f"{text}\n{note}"
+
+    return text
