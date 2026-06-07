@@ -1,147 +1,151 @@
-"""Communication summary processor.
+"""Triage processor: groups by thread, manages token budget, drives LLM batches.
 
-Responsible for:
-  - Preparing message batches for the model
-  - Building the triage prompt
-  - Sending each batch to the LLM agent
-  - Parsing and validating the JSON response
-  - Merging all batch results into one TriageResult
-
-The processor does NOT talk to O365 and does NOT write files.
+Pipeline per run:
+  1. Group messages by thread_id (None → treated as solo messages).
+  2. Split into token-aware batches (respects num_ctx).
+  3. Truncate message bodies to the per-message budget.
+  4. Format each batch using prompts.py templates.
+  5. Call OllamaAgent.triage_batch() for each batch.
+  6. Merge results into a TriageResult.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
+from collections import defaultdict
 
-from briefing_agent.models import MessageEnvelope, TriagedMessage, TriageResult, TriageCategory
-from briefing_agent.llm.agent import LLMAgent
-from briefing_agent.config import settings
+from briefing_agent.llm.agent import OllamaAgent
+from briefing_agent.models import MessageEnvelope, TriagedMessage, TriageResult
+from briefing_agent.prompts import (
+    build_triage_prompt,
+    format_message_for_prompt,
+    format_thread_block,
+)
+from briefing_agent.token_budget import (
+    split_into_token_aware_batches,
+    truncate_to_budget,
+)
 
 logger = logging.getLogger(__name__)
 
-PROMPT_TEMPLATE = """
-You are a communication triage assistant.
-Classify EACH message below into EXACTLY ONE category:
-  - needs_reply   : a real person is waiting for your response
-  - needs_action  : a concrete task you must do (not a newsletter or FYI)
-  - waiting_on    : someone else has the next move
-  - follow_up     : revisit later, no immediate action
-  - fyi           : informational only, no action required
 
-Rules:
-  - Newsletters, promotions, and automated notifications are ALWAYS fyi
-  - Meeting reminders are fyi (not waiting_on)
-  - A direct question from a real person is needs_reply, not follow_up
-  - waiting_on means YOU are not the next person to act
+class TriageProcessor:
+    def __init__(
+        self,
+        agent: OllamaAgent,
+        max_batch_size: int = 5,
+        weekly_context: str | None = None,
+    ) -> None:
+        self._agent = agent
+        self._max_batch_size = max_batch_size
+        self._weekly_context = weekly_context
 
-Return a JSON array with one object per message:
-[
-  {{
-    "id": "<message id>",
-    "category": "<category>",
-    "summary": "<one sentence, max 200 chars>",
-    "due_hint": "<timing phrase from email or null>",
-    "priority_hint": "<high|medium|low or null>",
-    "reply_intent": "<what to reply, only if needs_reply, else null>"
-  }}
-]
+    async def process(
+        self,
+        messages: list[MessageEnvelope],
+    ) -> TriageResult:
+        """Run the full triage pipeline and return a merged TriageResult."""
+        if not messages:
+            return TriageResult()
 
-Messages:
-{messages_block}
-"""
+        # 1. Group by thread for context-aware classification
+        ordered = self._group_by_thread(messages)
 
-
-class CommunicationSummaryProcessor:
-    def __init__(self) -> None:
-        self.agent = LLMAgent()
-
-    async def summarize_messages(self, messages: list[MessageEnvelope]) -> TriageResult:
-        batches = [
-            messages[i : i + settings.batch_size]
-            for i in range(0, len(messages), settings.batch_size)
-        ]
-        logger.info("Processing %d messages in %d batches", len(messages), len(batches))
-
-        all_items: list[TriagedMessage] = []
-        for idx, batch in enumerate(batches, 1):
-            logger.info("Batch %d/%d (%d messages)...", idx, len(batches), len(batch))
-            items = await self._process_batch(batch)
-            all_items.extend(items)
-
-        return self._merge(all_items)
-
-    async def _process_batch(self, batch: list[MessageEnvelope]) -> list[TriagedMessage]:
-        messages_block = "\n---\n".join(
-            f"ID: {m.id}\nFrom: {m.sender}\nSubject: {m.subject}\nBody: {m.body_preview}"
-            for m in batch
+        # 2. Split into token-aware batches
+        batches = split_into_token_aware_batches(
+            ordered,
+            num_ctx=self._agent.num_ctx,
+            max_batch_size=self._max_batch_size,
         )
-        prompt = PROMPT_TEMPLATE.format(messages_block=messages_block)
-
-        raw = await self.agent.complete(
-            prompt=prompt,
-            num_predict=settings.num_predict,
-            num_ctx=settings.num_ctx,
+        logger.info(
+            "Processing %d messages in %d batch(es).", len(messages), len(batches)
         )
 
-        return self._parse_response(raw, batch)
-
-    def _parse_response(
-        self, raw: str, batch: list[MessageEnvelope]
-    ) -> list[TriagedMessage]:
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            # Strip markdown code fences if model wrapped the JSON
-            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        # 3. Process each batch
+        all_triaged: list[TriagedMessage] = []
+        for i, batch in enumerate(batches, 1):
+            # Truncate bodies to fit token budget for this batch size
+            truncated = truncate_to_budget(
+                batch,
+                num_ctx=self._agent.num_ctx,
+                batch_size=len(batch),
+            )
+            prompt = self._build_prompt(truncated)
             try:
-                data = json.loads(cleaned)
-            except json.JSONDecodeError as exc:
-                logger.error("JSON parse failed for batch: %s", exc)
-                logger.debug("Raw response: %s", raw[:500])
-                return self._fallback_fyi(batch)
+                triaged = await self._agent.triage_batch(prompt)
+                all_triaged.extend(triaged)
+                logger.info("Batch %d/%d: classified %d message(s).", i, len(batches), len(triaged))
+            except RuntimeError as exc:
+                logger.error("Batch %d/%d failed, skipping: %s", i, len(batches), exc)
 
-        items: list[TriagedMessage] = []
-        id_set = {m.id for m in batch}
-        for obj in data:
-            try:
-                # Validate category is one we know
-                cat = obj.get("category", "fyi")
-                if cat not in TriageCategory.__members__.values():
-                    cat = "fyi"
-                items.append(
-                    TriagedMessage(
-                        id=obj.get("id", ""),
-                        category=TriageCategory(cat),
-                        summary=obj.get("summary", "")[:200],
-                        due_hint=obj.get("due_hint"),
-                        priority_hint=obj.get("priority_hint"),
-                        reply_intent=obj.get("reply_intent"),
-                    )
+        return self._to_triage_result(all_triaged)
+
+    def _group_by_thread(
+        self,
+        messages: list[MessageEnvelope],
+    ) -> list[MessageEnvelope]:
+        """Reorder messages so thread siblings are adjacent.
+
+        Within a thread, messages stay in received_at order.
+        Solo messages (no thread_id) retain their original position.
+        """
+        threaded: dict[str, list[MessageEnvelope]] = defaultdict(list)
+        solo: list[MessageEnvelope] = []
+        seen_threads: list[str] = []
+
+        for msg in messages:
+            if msg.thread_id:
+                if msg.thread_id not in seen_threads:
+                    seen_threads.append(msg.thread_id)
+                threaded[msg.thread_id].append(msg)
+            else:
+                solo.append(msg)
+
+        result: list[MessageEnvelope] = []
+        for thread_id in seen_threads:
+            sorted_msgs = sorted(threaded[thread_id], key=lambda m: m.received_at)
+            result.extend(sorted_msgs)
+        result.extend(solo)
+        return result
+
+    def _build_prompt(self, batch: list[MessageEnvelope]) -> str:
+        """Format a batch of messages into the triage prompt.
+
+        Messages sharing a thread_id are wrapped in a thread context block.
+        """
+        # Group by thread within this batch
+        thread_groups: dict[str | None, list[MessageEnvelope]] = defaultdict(list)
+        for msg in batch:
+            thread_groups[msg.thread_id].append(msg)
+
+        blocks: list[str] = []
+        for thread_id, msgs in thread_groups.items():
+            formatted = [
+                format_message_for_prompt(
+                    msg_id=m.id,
+                    sender=m.sender,
+                    subject=m.subject,
+                    body=m.body_preview,
+                    attachments=m.attachments or None,
+                    is_reply=m.is_reply,
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Skipping malformed item %s: %s", obj, exc)
+                for m in msgs
+            ]
+            if thread_id and len(msgs) > 1:
+                blocks.append(format_thread_block(thread_id, formatted))
+            else:
+                blocks.extend(formatted)
 
-        # Safety net: any message the model didn't return → fyi
-        returned_ids = {i.id for i in items}
-        for m in batch:
-            if m.id not in returned_ids and m.id in id_set:
-                logger.warning("Model did not return id=%s, defaulting to fyi", m.id)
-                items.append(TriagedMessage(id=m.id, category=TriageCategory.FYI, summary=m.subject))
-
-        return items
-
-    def _fallback_fyi(self, batch: list[MessageEnvelope]) -> list[TriagedMessage]:
-        return [
-            TriagedMessage(id=m.id, category=TriageCategory.FYI, summary=m.subject)
-            for m in batch
-        ]
+        messages_block = "\n\n".join(blocks)
+        return build_triage_prompt(
+            messages_block=messages_block,
+            weekly_context=self._weekly_context,
+        )
 
     @staticmethod
-    def _merge(items: list[TriagedMessage]) -> TriageResult:
+    def _to_triage_result(items: list[TriagedMessage]) -> TriageResult:
         result = TriageResult()
         for item in items:
-            getattr(result, item.category.value).append(item)
+            bucket = getattr(result, item.category.value)
+            bucket.append(item)
         return result

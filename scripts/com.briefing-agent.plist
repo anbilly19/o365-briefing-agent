@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+macOS launchd plist for o365-briefing-agent daily run.
+
+Install:
+  cp scripts/com.briefing-agent.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.briefing-agent.plist
+
+Fires at 07:30 every day. Unlike cron, launchd will fire on next wake
+if the machine was asleep at the scheduled time.
+
+Adjust WorkingDirectory and the uv path to match your setup.
+To find your uv path: which uv
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.briefing-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>cd /path/to/o365-briefing-agent &amp;&amp; /usr/local/bin/uv run briefing-agent</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/o365-briefing-agent</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/briefing-agent.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/briefing-agent.stderr.log</string>
+
+    <!-- Re-run on failure -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+</dict>
+</plist>
