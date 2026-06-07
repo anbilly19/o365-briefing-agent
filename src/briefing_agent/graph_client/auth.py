@@ -1,69 +1,126 @@
-"""MSAL token acquisition for Microsoft Graph.
+"""Microsoft Graph authentication via MSAL + optional system keychain.
 
-Supports two flows:
-  - Device code (interactive, for personal use)
-  - Client credentials (daemon, for server deployments)
+Token storage priority:
+  1. System keychain via `keyring` (most secure — recommended).
+  2. Plaintext file at data/token.json (fallback, with explicit warning).
 
-The token is cached in memory for the process lifetime.
+Security note:
+  Storing OAuth tokens in plaintext is a meaningful security risk.
+  Anyone with read access to data/token.json can access your mailbox.
+  keyring is a small dependency (already in pyproject.toml) that stores
+  tokens in the OS-native credential store (macOS Keychain, Windows
+  Credential Manager, Secret Service on Linux).
+  Set USE_KEYRING=false in .env to deliberately opt out.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import msal
 
-from briefing_agent.config import settings
-
 logger = logging.getLogger(__name__)
 
-SCOPES = [
-    "https://graph.microsoft.com/Mail.Read",
-    "https://graph.microsoft.com/Calendars.Read",
-]
-
-_token_cache: dict[str, Any] = {}
+_KEYRING_SERVICE = "o365-briefing-agent"
+_KEYRING_USERNAME = "graph-token"
+_FALLBACK_PATH = Path("data/token.json")
 
 
-def _build_app() -> msal.ConfidentialClientApplication | msal.PublicClientApplication:
-    if settings.ms_client_secret:
-        return msal.ConfidentialClientApplication(
-            client_id=settings.ms_client_id,
-            client_credential=settings.ms_client_secret,
-            authority=f"https://login.microsoftonline.com/{settings.ms_tenant_id}",
+def _load_keyring() -> dict[str, Any] | None:
+    try:
+        import keyring
+        raw = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+        if raw:
+            return json.loads(raw)  # type: ignore[no-any-return]
+    except Exception:
+        pass
+    return None
+
+
+def _save_keyring(data: dict[str, Any]) -> bool:
+    try:
+        import keyring
+        keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, json.dumps(data))
+        return True
+    except Exception:
+        return False
+
+
+def _load_file() -> dict[str, Any] | None:
+    if _FALLBACK_PATH.exists():
+        logger.warning(
+            "Loading OAuth token from plaintext file %s. "
+            "Consider setting USE_KEYRING=true for secure storage.",
+            _FALLBACK_PATH,
         )
-    return msal.PublicClientApplication(
-        client_id=settings.ms_client_id,
-        authority=f"https://login.microsoftonline.com/{settings.ms_tenant_id}",
+        return json.loads(_FALLBACK_PATH.read_text())  # type: ignore[no-any-return]
+    return None
+
+
+def _save_file(data: dict[str, Any]) -> None:
+    logger.warning(
+        "Saving OAuth token to plaintext file %s. "
+        "This is a security risk. Set USE_KEYRING=true to use the system keychain.",
+        _FALLBACK_PATH,
     )
+    _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _FALLBACK_PATH.write_text(json.dumps(data, indent=2))
 
 
-def get_token() -> str:
-    """Return a valid Bearer token, acquiring a new one if needed."""
-    global _token_cache
+class GraphAuth:
+    """MSAL-backed token cache with keyring/file persistence."""
 
-    if _token_cache.get("access_token"):
-        return _token_cache["access_token"]
+    def __init__(
+        self,
+        client_id: str,
+        tenant_id: str,
+        client_secret: str,
+        scopes: list[str],
+        use_keyring: bool = True,
+    ) -> None:
+        self._scopes = scopes
+        self._use_keyring = use_keyring
 
-    app = _build_app()
+        cache = msal.SerializableTokenCache()
+        cached = self._load()
+        if cached:
+            cache.deserialize(json.dumps(cached))
 
-    if isinstance(app, msal.ConfidentialClientApplication):
-        # Daemon / server flow
-        result = app.acquire_token_for_client(
-            scopes=["https://graph.microsoft.com/.default"]
+        self._app = msal.ConfidentialClientApplication(
+            client_id=client_id,
+            client_credential=client_secret,
+            authority=f"https://login.microsoftonline.com/{tenant_id}",
+            token_cache=cache,
         )
-    else:
-        # Interactive device-code flow
-        flow = app.initiate_device_flow(scopes=SCOPES)
-        if "user_code" not in flow:
-            raise RuntimeError(f"Device flow failed: {flow}")
-        print(f"\nOpen {flow['verification_uri']} and enter code: {flow['user_code']}")
-        result = app.acquire_token_by_device_flow(flow)
+        self._cache = cache
 
-    if "access_token" not in result:
-        raise RuntimeError(f"Token acquisition failed: {result.get('error_description')}")
+    def _load(self) -> dict[str, Any] | None:
+        if self._use_keyring:
+            data = _load_keyring()
+            if data:
+                return data
+        return _load_file()
 
-    _token_cache = result
-    logger.info("Token acquired for tenant %s", settings.ms_tenant_id)
-    return result["access_token"]
+    def _persist(self) -> None:
+        if not self._cache.has_state_changed:
+            return
+        data = json.loads(self._cache.serialize())
+        if self._use_keyring and _save_keyring(data):
+            return
+        _save_file(data)
+
+    def get_token(self) -> str:
+        """Return a valid access token, refreshing if needed."""
+        accounts = self._app.get_accounts()
+        result = None
+        if accounts:
+            result = self._app.acquire_token_silent(self._scopes, account=accounts[0])
+        if not result:
+            result = self._app.acquire_token_for_client(scopes=self._scopes)
+        if "access_token" not in result:
+            raise RuntimeError(f"MSAL error: {result.get('error_description', result)}")
+        self._persist()
+        return result["access_token"]  # type: ignore[index]
