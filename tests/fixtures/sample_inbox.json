@@ -1,0 +1,44 @@
+[
+  {
+    "id": "bench_001",
+    "subject": "Quick question about the Q3 report",
+    "sender": "alice@company.com",
+    "body_preview": "Hi, do you have the Q3 numbers ready? I need them for the board deck by Friday.",
+    "expected_category": "needs_reply"
+  },
+  {
+    "id": "bench_002",
+    "subject": "Your invoice #4821 is due",
+    "sender": "billing@supplier.com",
+    "body_preview": "Please pay invoice #4821 for $1,200 by 15 July to avoid late fees.",
+    "expected_category": "needs_action"
+  },
+  {
+    "id": "bench_003",
+    "subject": "Re: Proposal review",
+    "sender": "bob@client.com",
+    "body_preview": "Thanks for sending the proposal. I've forwarded it to our legal team and will get back to you next week.",
+    "expected_category": "waiting_on"
+  },
+  {
+    "id": "bench_004",
+    "subject": "GitHub Actions build failed",
+    "sender": "notifications@github.com",
+    "body_preview": "Your workflow 'CI' failed on branch main. View the run for details.",
+    "expected_category": "fyi"
+  },
+  {
+    "id": "bench_005",
+    "subject": "Team lunch next Thursday",
+    "sender": "manager@company.com",
+    "body_preview": "We'll be doing a team lunch on Thursday at noon. No action needed, just a heads-up.",
+    "expected_category": "fyi"
+  },
+  {
+    "id": "bench_006",
+    "subject": "Follow up: contract renewal",
+    "sender": "sales@vendor.com",
+    "body_preview": "Just circling back on the contract renewal we discussed. No rush but wanted to stay on your radar.",
+    "expected_category": "follow_up"
+  }
+]
