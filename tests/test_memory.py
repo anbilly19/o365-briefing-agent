@@ -29,8 +29,7 @@ async def db(tmp_path: Path) -> MemoryDB:
 
 async def test_start_run_returns_id(db: MemoryDB) -> None:
     run_id = await db.start_run()
-    assert isinstance(run_id, str)
-    assert len(run_id) > 0
+    assert isinstance(run_id, str) and len(run_id) > 0
 
 
 async def test_run_initially_in_progress(db: MemoryDB) -> None:
@@ -105,3 +104,70 @@ async def test_context_manager(tmp_path: Path) -> None:
     async with MemoryDB(db_path=tmp_path / "ctx.db") as mem:
         run_id = await mem.start_run()
         assert run_id
+
+
+# --- triage index / dedup ---
+
+async def test_was_triaged_returns_false_for_unknown(db: MemoryDB) -> None:
+    result = await db.was_triaged("unknown_id")
+    assert result is False
+
+
+async def test_was_triaged_returns_true_after_complete_run(db: MemoryDB) -> None:
+    run_id = await db.start_run()
+    await db.finish_run(run_id, [_make_msg("msg_abc")])
+    assert await db.was_triaged("msg_abc") is True
+
+
+async def test_was_triaged_false_for_in_progress_run(db: MemoryDB) -> None:
+    """A message in an in-progress run should not count as triaged."""
+    run_id = await db.start_run()
+    await db.finish_run(run_id, [_make_msg("msg_x")], status=RunStatus.IN_PROGRESS)
+    # run is still in_progress — was_triaged should return False
+    assert await db.was_triaged("msg_x") is False
+
+
+async def test_get_previous_classification(db: MemoryDB) -> None:
+    run_id = await db.start_run()
+    msg = _make_msg("msg_q")
+    await db.finish_run(run_id, [msg], reasons={"msg_q": "heuristic: noreply"})
+    row = await db.get_previous_classification("msg_q")
+    assert row is not None
+    assert row["reason"] == "heuristic: noreply"
+    assert row["category"] == TriageCategory.NEEDS_REPLY
+
+
+# --- feedback ---
+
+async def test_record_and_retrieve_feedback(db: MemoryDB) -> None:
+    run_id = await db.start_run()
+    await db.record_feedback(
+        message_id="msg_1",
+        run_id=run_id,
+        old_category="fyi",
+        new_category="needs_reply",
+        vote="wrong",
+        note="This was from my manager",
+    )
+    rows = await db.get_feedback_for_message("msg_1")
+    assert len(rows) == 1
+    assert rows[0]["vote"] == "wrong"
+    assert rows[0]["note"] == "This was from my manager"
+
+
+async def test_get_recent_wrong_votes(db: MemoryDB) -> None:
+    run_id = await db.start_run()
+    await db.record_feedback("m1", run_id, "fyi", "needs_reply", "wrong")
+    await db.record_feedback("m2", run_id, "fyi", "needs_action", "correct")
+    wrong = await db.get_recent_wrong_votes()
+    ids = [r["message_id"] for r in wrong]
+    assert "m1" in ids
+    assert "m2" not in ids
+
+
+async def test_feedback_multiple_votes_per_message(db: MemoryDB) -> None:
+    run_id = await db.start_run()
+    for i in range(3):
+        await db.record_feedback("msg_z", run_id, "fyi", "needs_reply", "wrong")
+    rows = await db.get_feedback_for_message("msg_z")
+    assert len(rows) == 3

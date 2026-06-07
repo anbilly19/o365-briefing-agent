@@ -1,0 +1,44 @@
+# Category display configuration
+# Maps internal category keys to user-facing labels, icons, and optional
+# target folders/tags in your mail client.
+#
+# To rename a category in the briefing output, edit 'display_name'.
+# The internal 'key' values must not be changed — they are used throughout the codebase.
+# Thunderbird users: set 'tag' to a Thunderbird tag name to enable auto-tagging.
+# IMAP users: set 'folder' to move matched messages.
+
+categories:
+  - key: needs_reply
+    display_name: "Reply needed"
+    icon: "✉️"
+    description: "A real person is waiting for your response."
+    tag: null          # Thunderbird tag (optional)
+    folder: null       # IMAP folder (optional)
+
+  - key: needs_action
+    display_name: "Action required"
+    icon: "⚡"
+    description: "You have a concrete task to complete."
+    tag: null
+    folder: null
+
+  - key: waiting_on
+    display_name: "Waiting on others"
+    icon: "⏳"
+    description: "Someone else must act next; you are blocked."
+    tag: null
+    folder: null
+
+  - key: follow_up
+    display_name: "Follow up"
+    icon: "🔁"
+    description: "Revisit later; no immediate action."
+    tag: null
+    folder: null
+
+  - key: fyi
+    display_name: "FYI"
+    icon: "ℹ️"
+    description: "Informational only, no action expected."
+    tag: null
+    folder: null

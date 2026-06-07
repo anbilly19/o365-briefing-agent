@@ -1,0 +1,109 @@
+# Cascade pre-filter rules
+# Messages matching any rule here are classified WITHOUT calling the LLM.
+# This saves tokens and latency for obvious cases.
+#
+# Rules are evaluated in order. First match wins.
+# Supported matchers:
+#   sender_contains   - substring match on sender email address (case-insensitive)
+#   subject_contains  - substring match on subject line (case-insensitive)
+#   body_contains     - substring match on cleaned body (case-insensitive)
+#   has_unsubscribe   - true if the body contains unsubscribe patterns
+#
+# Actions:
+#   category  - one of: needs_reply, needs_action, waiting_on, follow_up, fyi
+#   reason    - short string logged and stored as classification reason
+#   skip      - if true, message is dropped entirely (not included in briefing)
+
+rules:
+  # ---------- Hard drops (noise) ----------
+  - name: noreply_sender
+    matcher: sender_contains
+    value: "noreply"
+    action:
+      category: fyi
+      reason: "Automated sender (noreply)"
+
+  - name: donotreply_sender
+    matcher: sender_contains
+    value: "do-not-reply"
+    action:
+      category: fyi
+      reason: "Automated sender (do-not-reply)"
+
+  - name: donotreply_sender_variant
+    matcher: sender_contains
+    value: "donotreply"
+    action:
+      category: fyi
+      reason: "Automated sender (donotreply)"
+
+  - name: unsubscribe_link
+    matcher: has_unsubscribe
+    action:
+      category: fyi
+      reason: "Contains unsubscribe link (newsletter/marketing)"
+
+  # ---------- Known automated senders ----------
+  - name: github_notifications
+    matcher: sender_contains
+    value: "notifications@github.com"
+    action:
+      category: fyi
+      reason: "GitHub notification"
+
+  - name: jira_notifications
+    matcher: sender_contains
+    value: "jira@"
+    action:
+      category: fyi
+      reason: "Jira notification"
+
+  - name: calendar_invite
+    matcher: subject_contains
+    value: "invitation:"
+    action:
+      category: fyi
+      reason: "Calendar invite"
+
+  - name: calendar_accepted
+    matcher: subject_contains
+    value: "accepted:"
+    action:
+      category: fyi
+      reason: "Calendar accepted notification"
+
+  - name: ci_build
+    matcher: subject_contains
+    value: "build "
+    action:
+      category: fyi
+      reason: "CI/CD build notification"
+
+  - name: ci_pipeline
+    matcher: subject_contains
+    value: "pipeline "
+    action:
+      category: fyi
+      reason: "CI/CD pipeline notification"
+
+  # ---------- Likely action items ----------
+  - name: docusign
+    matcher: sender_contains
+    value: "docusign"
+    action:
+      category: needs_action
+      reason: "DocuSign signature request"
+
+  - name: approve_request
+    matcher: subject_contains
+    value: "approval required"
+    action:
+      category: needs_action
+      reason: "Approval required (subject match)"
+
+  - name: action_required
+    matcher: subject_contains
+    value: "action required"
+    action:
+      category: needs_action
+      reason: "Action required (subject match)"

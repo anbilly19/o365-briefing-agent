@@ -1,7 +1,6 @@
 """Pydantic models for shared data shapes.
 
-All pipeline components share these types. No component should
-define its own private message or event shape.
+All pipeline components share these types.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from pydantic import BaseModel, Field
 
 
 class TriageCategory(StrEnum):
-    """Must match the category labels in prompts.TRIAGE_CATEGORIES exactly."""
+    """Must match category labels in prompts.TRIAGE_CATEGORIES and categories.yaml."""
     NEEDS_REPLY = "needs_reply"
     NEEDS_ACTION = "needs_action"
     WAITING_ON = "waiting_on"
@@ -28,16 +27,29 @@ class RunStatus(StrEnum):
     FAILED = "failed"
 
 
+class FeedbackVote(StrEnum):
+    CORRECT = "correct"
+    WRONG = "wrong"
+    SNOOZE = "snooze"
+
+
+class ConnectorSource(StrEnum):
+    GRAPH = "graph"
+    IMAP = "imap"
+    GMAIL = "gmail"
+
+
 class MessageEnvelope(BaseModel):
     """Normalised input shape — connector-agnostic."""
     id: str
     subject: str
     sender: str
     received_at: datetime
-    body_preview: str          # cleaned, truncated body
+    body_preview: str
     thread_id: str | None = None
     is_reply: bool = False
-    attachments: list[str] = Field(default_factory=list)  # filenames only, no content
+    attachments: list[str] = Field(default_factory=list)
+    source: ConnectorSource = ConnectorSource.GRAPH
 
 
 class TriagedMessage(BaseModel):
@@ -47,7 +59,7 @@ class TriagedMessage(BaseModel):
     summary: Annotated[str, Field(max_length=200)]
     due_hint: str | None = None
     priority_hint: str | None = None
-    reply_intent: str | None = None  # only populated when category == needs_reply
+    reply_intent: str | None = None
 
 
 class TriageResult(BaseModel):

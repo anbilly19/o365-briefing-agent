@@ -1,4 +1,4 @@
-"""Persistent memory for run state, classifications, and Graph delta tokens.
+"""Persistent memory for run state, classifications, triage index, and feedback.
 
 Schema
 ------
@@ -9,26 +9,44 @@ Schema
     status          TEXT NOT NULL  -- RunStatus enum value
     message_count   INTEGER DEFAULT 0
 
-  classified_messages
-    id              TEXT PRIMARY KEY
+  classified_messages                        <-- per-message triage index
+    id              TEXT NOT NULL           -- Graph message id (or RFC Message-ID)
     run_id          TEXT NOT NULL REFERENCES runs(id)
     category        TEXT NOT NULL
+    reason          TEXT                    -- 'heuristic: noreply sender' or 'llm'
     summary         TEXT NOT NULL
     due_hint        TEXT
     priority_hint   TEXT
     reply_intent    TEXT
     classified_at   TEXT NOT NULL
+    PRIMARY KEY (id, run_id)               -- same msg can appear in multiple runs
 
   delta_tokens
-    resource        TEXT PRIMARY KEY   -- e.g. 'mailbox', 'calendar'
+    resource        TEXT PRIMARY KEY
     token           TEXT NOT NULL
+    recorded_at     TEXT NOT NULL
+
+  feedback
+    id              INTEGER PRIMARY KEY AUTOINCREMENT
+    message_id      TEXT NOT NULL
+    run_id          TEXT NOT NULL
+    old_category    TEXT NOT NULL
+    new_category    TEXT NOT NULL
+    vote            TEXT NOT NULL  -- 'correct' | 'wrong' | 'snooze'
+    note            TEXT
     recorded_at     TEXT NOT NULL
 
 Transactions
 -----------
-Every write is wrapped in a transaction. If a run crashes mid-pipeline the
-run row stays in status='in_progress'. On next startup the orchestrator
-should call detect_stale_runs() and mark them as 'failed'.
+Every multi-step write is wrapped in an explicit transaction.
+If a run crashes mid-pipeline the run row stays in status='in_progress'.
+Call detect_stale_runs() on next startup and mark them as 'failed'.
+
+Triage index / dedup
+--------------------
+was_triaged(message_id) checks whether a message was classified in any
+complete run. This lets the pipeline skip re-triaging unchanged messages
+across runs when combined with delta queries.
 """
 
 from __future__ import annotations
@@ -86,35 +104,52 @@ class MemoryDB:
             );
 
             CREATE TABLE IF NOT EXISTS classified_messages (
-                id            TEXT PRIMARY KEY,
+                id            TEXT NOT NULL,
                 run_id        TEXT NOT NULL REFERENCES runs(id),
                 category      TEXT NOT NULL,
+                reason        TEXT,
                 summary       TEXT NOT NULL,
                 due_hint      TEXT,
                 priority_hint TEXT,
                 reply_intent  TEXT,
-                classified_at TEXT NOT NULL
+                classified_at TEXT NOT NULL,
+                PRIMARY KEY (id, run_id)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_cm_message_id
+                ON classified_messages(id);
 
             CREATE TABLE IF NOT EXISTS delta_tokens (
                 resource    TEXT PRIMARY KEY,
                 token       TEXT NOT NULL,
                 recorded_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS feedback (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id    TEXT NOT NULL,
+                run_id        TEXT NOT NULL,
+                old_category  TEXT NOT NULL,
+                new_category  TEXT NOT NULL,
+                vote          TEXT NOT NULL,
+                note          TEXT,
+                recorded_at   TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_message_id
+                ON feedback(message_id);
         """)
 
     # --- run management ---
 
     async def start_run(self) -> str:
-        """Insert a new run row with status=in_progress. Returns the run id."""
         run_id = str(uuid.uuid4())
         now = _now_iso()
         assert self._db
-        async with self._db.execute(
+        await self._db.execute(
             "INSERT INTO runs (id, started_at, status) VALUES (?, ?, ?)",
             (run_id, now, RunStatus.IN_PROGRESS),
-        ):
-            pass
+        )
         await self._db.commit()
         return run_id
 
@@ -123,29 +158,36 @@ class MemoryDB:
         run_id: str,
         messages: list[TriagedMessage],
         status: RunStatus = RunStatus.COMPLETE,
+        reasons: dict[str, str] | None = None,
     ) -> None:
         """Persist all triaged messages and mark the run as complete/failed.
 
-        All writes are wrapped in a single transaction. If anything fails,
-        none of the classifications are committed.
+        Args:
+            run_id:   The run being finalised.
+            messages: All TriagedMessage objects from this run.
+            status:   Final run status.
+            reasons:  Optional map of message_id -> reason string
+                      (e.g. 'heuristic: noreply sender' or 'llm').
+                      Used to populate the triage index.
         """
         now = _now_iso()
+        reasons = reasons or {}
         assert self._db
-        async with self._db.execute("BEGIN"):
-            pass
+        await self._db.execute("BEGIN")
         try:
             for msg in messages:
                 await self._db.execute(
                     """
                     INSERT OR REPLACE INTO classified_messages
-                        (id, run_id, category, summary, due_hint,
+                        (id, run_id, category, reason, summary, due_hint,
                          priority_hint, reply_intent, classified_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         msg.id,
                         run_id,
                         msg.category,
+                        reasons.get(msg.id, "llm"),
                         msg.summary,
                         msg.due_hint,
                         msg.priority_hint,
@@ -167,7 +209,6 @@ class MemoryDB:
             raise
 
     async def detect_stale_runs(self) -> list[str]:
-        """Return run ids that are still in_progress (crashed previously)."""
         assert self._db
         async with self._db.execute(
             "SELECT id FROM runs WHERE status = ?", (RunStatus.IN_PROGRESS,)
@@ -182,6 +223,89 @@ class MemoryDB:
             (RunStatus.FAILED, _now_iso(), run_id),
         )
         await self._db.commit()
+
+    # --- triage index / dedup ---
+
+    async def was_triaged(self, message_id: str) -> bool:
+        """Return True if this message was classified in any completed run."""
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT 1 FROM classified_messages cm
+            JOIN runs r ON cm.run_id = r.id
+            WHERE cm.id = ? AND r.status = ?
+            LIMIT 1
+            """,
+            (message_id, RunStatus.COMPLETE),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def get_previous_classification(
+        self, message_id: str
+    ) -> aiosqlite.Row | None:
+        """Return the most recent completed classification for a message."""
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT cm.* FROM classified_messages cm
+            JOIN runs r ON cm.run_id = r.id
+            WHERE cm.id = ? AND r.status = ?
+            ORDER BY cm.classified_at DESC
+            LIMIT 1
+            """,
+            (message_id, RunStatus.COMPLETE),
+        ) as cur:
+            return await cur.fetchone()
+
+    # --- feedback ---
+
+    async def record_feedback(
+        self,
+        message_id: str,
+        run_id: str,
+        old_category: str,
+        new_category: str,
+        vote: str,
+        note: str | None = None,
+    ) -> None:
+        """Record a user correction for a triaged message.
+
+        vote: 'correct' | 'wrong' | 'snooze'
+        """
+        assert self._db
+        await self._db.execute(
+            """
+            INSERT INTO feedback
+                (message_id, run_id, old_category, new_category, vote, note, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_id, run_id, old_category, new_category, vote, note, _now_iso()),
+        )
+        await self._db.commit()
+
+    async def get_feedback_for_message(
+        self, message_id: str
+    ) -> list[aiosqlite.Row]:
+        assert self._db
+        async with self._db.execute(
+            "SELECT * FROM feedback WHERE message_id = ? ORDER BY recorded_at DESC",
+            (message_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def get_recent_wrong_votes(
+        self, limit: int = 50
+    ) -> list[aiosqlite.Row]:
+        """Return recent 'wrong' votes — useful for rule review and fine-tuning."""
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT * FROM feedback WHERE vote = 'wrong'
+            ORDER BY recorded_at DESC LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            return await cur.fetchall()
 
     # --- delta token management ---
 
