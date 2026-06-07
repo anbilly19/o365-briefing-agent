@@ -1,8 +1,7 @@
 """Pydantic models for shared data shapes.
 
-The connector's job is to normalise raw source data (O365, Gmail, test JSON)
-into TriagedMessage / MessageEnvelope. The rest of the pipeline only
-sees these shapes and does not care where the data came from.
+All pipeline components share these types. No component should
+define its own private message or event shape.
 """
 
 from __future__ import annotations
@@ -14,7 +13,8 @@ from typing import Annotated
 from pydantic import BaseModel, Field
 
 
-class TriageCategory(StrEnum):  # must match prompt exactly
+class TriageCategory(StrEnum):
+    """Must match the category labels in prompts.TRIAGE_CATEGORIES exactly."""
     NEEDS_REPLY = "needs_reply"
     NEEDS_ACTION = "needs_action"
     WAITING_ON = "waiting_on"
@@ -22,31 +22,41 @@ class TriageCategory(StrEnum):  # must match prompt exactly
     FYI = "fyi"
 
 
-class MessageEnvelope(BaseModel):  # normalised input shape
+class RunStatus(StrEnum):
+    IN_PROGRESS = "in_progress"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+class MessageEnvelope(BaseModel):
+    """Normalised input shape — connector-agnostic."""
     id: str
     subject: str
     sender: str
     received_at: datetime
-    body_preview: str  # cleaned, truncated body — not the full raw email
+    body_preview: str          # cleaned, truncated body
     thread_id: str | None = None
     is_reply: bool = False
+    attachments: list[str] = Field(default_factory=list)  # filenames only, no content
 
 
-class TriagedMessage(BaseModel):  # LLM output shape per message
+class TriagedMessage(BaseModel):
+    """LLM output shape per message — must match JSON schema in prompts.py."""
     id: str
     category: TriageCategory
     summary: Annotated[str, Field(max_length=200)]
-    due_hint: str | None = None     # e.g. "by Monday", "in 3 days"
-    priority_hint: str | None = None  # e.g. "high", "low"
-    reply_intent: str | None = None  # only if category == needs_reply
+    due_hint: str | None = None
+    priority_hint: str | None = None
+    reply_intent: str | None = None  # only populated when category == needs_reply
 
 
-class TriageResult(BaseModel):  # merged output from all batches
-    needs_reply: list[TriagedMessage] = []
-    needs_action: list[TriagedMessage] = []
-    waiting_on: list[TriagedMessage] = []
-    follow_up: list[TriagedMessage] = []
-    fyi: list[TriagedMessage] = []
+class TriageResult(BaseModel):
+    """Merged output from all batches."""
+    needs_reply: list[TriagedMessage] = Field(default_factory=list)
+    needs_action: list[TriagedMessage] = Field(default_factory=list)
+    waiting_on: list[TriagedMessage] = Field(default_factory=list)
+    follow_up: list[TriagedMessage] = Field(default_factory=list)
+    fyi: list[TriagedMessage] = Field(default_factory=list)
 
     def all_items(self) -> list[TriagedMessage]:
         return (
@@ -57,6 +67,9 @@ class TriageResult(BaseModel):  # merged output from all batches
             + self.fyi
         )
 
+    def total(self) -> int:
+        return len(self.all_items())
+
 
 class CalendarEvent(BaseModel):
     id: str
@@ -65,4 +78,9 @@ class CalendarEvent(BaseModel):
     end: datetime
     location: str | None = None
     is_online: bool = False
-    attendees: list[str] = []
+    attendees: list[str] = Field(default_factory=list)
+
+
+class TriagedMessageList(BaseModel):
+    """Wrapper so Ollama JSON schema enforcement works on the full batch output."""
+    items: list[TriagedMessage]
